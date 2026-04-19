@@ -1,15 +1,16 @@
 """
-MoA Prediction — LogReg + Kernel Approximation ensemble
-Strategy: avoid MLPs (too slow to converge on this CPU); instead use
-  1. LogReg on rich PCA + interaction features (baseline linear model)
-  2. LogReg on RBF kernel approximation (non-linear, RBF-SVM equivalent)
-  3. LogReg on explicit degree-2 interactions of top PCA components
-
-All LogReg models are well-calibrated. Per-target adaptive Bayesian
-calibration provides final correction toward training base rates.
-
-Sets OMP_NUM_THREADS=1 before imports so loky parallel workers don't
-fight over BLAS threads.
+MoA Prediction — Rich feature LogReg ensemble v2
+Features match chanbin-test-moa's best (af3682d5):
+  - PCA(200 gene + 60 cell + 50 combined)
+  - Gene-PCA × cp_time/cp_dose interaction features (top-20 PCs)
+  - Cross-PCA: top-5 gene × top-5 cell
+  - Per-row statistics: kurtosis, percentiles, IQR
+  - Top-30 raw high-variance gene features
+Improvements:
+  - Per-target adaptive Bayesian calibration
+  - Nystroem kernel model (better kernel approximation than RBFSampler)
+  - 5 LogReg C-values for better diversity
+  - Fix: DummyClassifier class ordering bug (critical for all-zero columns)
 """
 import os
 os.environ['OMP_NUM_THREADS'] = '1'
@@ -24,7 +25,7 @@ from joblib import Parallel, delayed
 from scipy.stats import kurtosis as kurtosis_fn
 from sklearn.decomposition import PCA
 from sklearn.dummy import DummyClassifier
-from sklearn.kernel_approximation import RBFSampler
+from sklearn.kernel_approximation import Nystroem
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
@@ -53,11 +54,12 @@ gsc  = StandardScaler().fit(Xtr[gene_cols])
 csc  = StandardScaler().fit(Xtr[cell_cols])
 gcsc = StandardScaler().fit(Xtr[gene_cols + cell_cols])
 
-g_pca  = PCA(n_components=150, random_state=42).fit(gsc.transform(Xtr[gene_cols]))
-c_pca  = PCA(n_components=50,  random_state=42).fit(csc.transform(Xtr[cell_cols]))
-gc_pca = PCA(n_components=40,  random_state=42).fit(gcsc.transform(Xtr[gene_cols + cell_cols]))
+# Match chanbin's best PCA settings
+g_pca  = PCA(n_components=200, random_state=42).fit(gsc.transform(Xtr[gene_cols]))
+c_pca  = PCA(n_components=60,  random_state=42).fit(csc.transform(Xtr[cell_cols]))
+gc_pca = PCA(n_components=50,  random_state=42).fit(gcsc.transform(Xtr[gene_cols + cell_cols]))
 
-# top-variance raw features (extra signal for rare targets)
+# Top-variance raw features
 top_g_cols = Xtr[gene_cols].var().nlargest(30).index.tolist()
 top_c_cols = Xtr[cell_cols].var().nlargest(20).index.tolist()
 tgsc = StandardScaler().fit(Xtr[top_g_cols])
@@ -67,39 +69,41 @@ def make_features(df):
     g  = gsc.transform(df[gene_cols])
     c  = csc.transform(df[cell_cols])
     gc = gcsc.transform(df[gene_cols + cell_cols])
-    gp  = g_pca.transform(g)    # (n, 150)
-    cp_ = c_pca.transform(c)    # (n, 50)
-    gcp = gc_pca.transform(gc)  # (n, 40)
+    gp  = g_pca.transform(g)    # (n, 200)
+    cp_ = c_pca.transform(c)    # (n, 60)
+    gcp = gc_pca.transform(gc)  # (n, 50)
 
     t    = df["cp_time"].values.astype(float)
     dose = (df["cp_dose"] == "D2").astype(float).values
     tnorm = (t - 24) / 48
     t_oh  = np.column_stack([(t == v).astype(float) for v in [24, 48, 72]])
 
-    # gene-PCA × condition interactions (top-20 gene PCs)
+    # gene-PCA × condition interactions (top-20 gene PCs = 60 features)
     ints = np.hstack([
         gp[:, :20] * tnorm[:, None],
         gp[:, :20] * dose[:, None],
         gp[:, :20] * (tnorm * dose)[:, None],
-    ])  # (n, 60)
+    ])
 
-    # cross-PCA: top-5 gene PC × top-5 cell PC
+    # cross-PCA: top-5 gene PC × top-5 cell PC (25 features)
     cross = (gp[:, :5, None] * cp_[:, None, :5]).reshape(len(df), 25)
 
-    # per-row statistics
+    # per-row gene statistics (kurtosis + 5 percentiles + IQR = 8)
     raw_g = df[gene_cols].values
     raw_c = df[cell_cols].values
     g_kurt = kurtosis_fn(raw_g, axis=1).reshape(-1, 1)
     c_kurt = kurtosis_fn(raw_c, axis=1).reshape(-1, 1)
-    g_iqr  = (np.percentile(raw_g, 75, axis=1) - np.percentile(raw_g, 25, axis=1)).reshape(-1, 1)
-    c_iqr  = (np.percentile(raw_c, 75, axis=1) - np.percentile(raw_c, 25, axis=1)).reshape(-1, 1)
+    g_pct  = np.percentile(raw_g, [10, 25, 50, 75, 90], axis=1).T  # (n, 5)
+    c_pct  = np.percentile(raw_c, [10, 25, 50, 75, 90], axis=1).T  # (n, 5)
+    g_iqr  = (g_pct[:, 3] - g_pct[:, 1]).reshape(-1, 1)
+    c_iqr  = (c_pct[:, 3] - c_pct[:, 1]).reshape(-1, 1)
 
-    tg   = tgsc.transform(df[top_g_cols])
-    tc   = tcsc.transform(df[top_c_cols])
-    cond = np.column_stack([tnorm, dose, tnorm * dose, t_oh])
+    tg   = tgsc.transform(df[top_g_cols])   # (n, 30)
+    tc   = tcsc.transform(df[top_c_cols])   # (n, 20)
+    cond = np.column_stack([tnorm, dose, tnorm * dose, t_oh])  # (n, 6)
 
     return np.hstack([gp, cp_, gcp, ints, cross,
-                      g_kurt, c_kurt, g_iqr, c_iqr,
+                      g_kurt, c_kurt, g_pct, c_pct, g_iqr, c_iqr,
                       tg, tc, cond]).astype(np.float32)
 
 print("Building features...")
@@ -111,28 +115,15 @@ fsc   = StandardScaler().fit(Xtr_f)
 Xtr_s = fsc.transform(Xtr_f)
 Xte_s = fsc.transform(Xte_f)
 
-# RBF kernel features for non-linearity (multiple gammas)
-rbf_maps = []
-for gamma in [0.01, 0.1, 1.0]:
-    rbf = RBFSampler(gamma=gamma, n_components=500, random_state=42).fit(Xtr_s)
-    rbf_maps.append(rbf)
-    print(f"  RBF gamma={gamma}: {time.time()-t0:.1f}s")
-
-# Explicit degree-2 interactions on top-20 PCA components + conditions
-# Top-20 gene PCA + 3 conditions = 23 features → 23×22/2 = 253 interaction pairs
-top_feats = Xtr_s[:, :20]   # top-20 gene PCA components (after StandardScaler)
-top_te    = Xte_s[:, :20]
-n = top_feats.shape[0]
-pairs_tr = np.column_stack([top_feats[:, i] * top_feats[:, j]
-                             for i in range(20) for j in range(i+1, 20)])
-pairs_te = np.column_stack([top_te[:, i] * top_te[:, j]
-                             for i in range(20) for j in range(i+1, 20)])
-poly_tr = np.hstack([Xtr_s, pairs_tr]).astype(np.float32)
-poly_te = np.hstack([Xte_s, pairs_te]).astype(np.float32)
-poly_fsc = StandardScaler().fit(poly_tr)
-poly_tr = poly_fsc.transform(poly_tr)
-poly_te = poly_fsc.transform(poly_te)
-print(f"  poly dim={poly_tr.shape[1]}  ({time.time()-t0:.1f}s)")
+# Nystroem kernel approximation (non-linear model via kernel trick)
+print("Fitting Nystroem kernel...")
+nys = Nystroem(kernel='rbf', gamma=0.05, n_components=300, random_state=42).fit(Xtr_s)
+Xtr_nys = nys.transform(Xtr_s).astype(np.float32)
+Xte_nys = nys.transform(Xte_s).astype(np.float32)
+nys_fsc = StandardScaler().fit(Xtr_nys)
+Xtr_nys = nys_fsc.transform(Xtr_nys)
+Xte_nys = nys_fsc.transform(Xte_nys)
+print(f"  Nystroem dim={Xtr_nys.shape[1]}  ({time.time()-t0:.1f}s)")
 
 # ── parallel per-target fitting ────────────────────────────────────────────────
 def fit_lr(X_tr, y_col, C):
@@ -147,8 +138,7 @@ def fit_lr(X_tr, y_col, C):
 def predict_clf(clf, X_te):
     classes = list(clf.classes_) if hasattr(clf, 'classes_') else [0, 1]
     if 1 not in classes:
-        # Only class 0 seen in training — positive class has zero probability
-        return np.zeros(len(X_te))
+        return np.zeros(len(X_te))   # all-zero training → predict 0 for positive class
     p = clf.predict_proba(X_te)
     return p[:, classes.index(1)]
 
@@ -166,30 +156,24 @@ def sweep(X_tr, X_te, C, label):
 print("Warming up worker pool...")
 Parallel(n_jobs=-1)([delayed(lambda: 1)() for _ in range(48)])
 
-# 1. Base LogReg (three C values)
+# Base LogReg (5 C values for diversity)
 print(f"Base LogReg sweeps... ({time.time()-t0:.1f}s elapsed)")
 base_preds = []
-for C in [0.05, 0.10, 0.20]:
+for C in [0.02, 0.05, 0.10, 0.20, 0.50]:
     base_preds.append(sweep(Xtr_s, Xte_s, C, f"LR base C={C}"))
 
-# 2. RBF kernel LogReg (three gammas)
-print(f"RBF kernel LogReg... ({time.time()-t0:.1f}s elapsed)")
-rbf_preds = []
-for gamma, rbf in zip([0.01, 0.1, 1.0], rbf_maps):
-    Xtr_rbf = rbf.transform(Xtr_s).astype(np.float32)
-    Xte_rbf = rbf.transform(Xte_s).astype(np.float32)
-    rbf_preds.append(sweep(Xtr_rbf, Xte_rbf, 0.1, f"LR RBF gamma={gamma}"))
+# Nystroem kernel LogReg
+print(f"Nystroem LogReg... ({time.time()-t0:.1f}s elapsed)")
+nys_preds = []
+for C in [0.1, 0.5]:
+    nys_preds.append(sweep(Xtr_nys, Xte_nys, C, f"LR Nystroem C={C}"))
 
-# 3. Polynomial feature LogReg
-print(f"Polynomial LogReg... ({time.time()-t0:.1f}s elapsed)")
-poly_preds = [sweep(poly_tr, poly_te, 0.1, "LR poly")]
-
-# ── blend all models ───────────────────────────────────────────────────────────
-all_preds = base_preds + rbf_preds + poly_preds   # 7 models
+# ── blend + adaptive calibration ──────────────────────────────────────────────
+all_preds = base_preds + nys_preds   # 7 models
 blend = np.mean(all_preds, axis=0)
 
-# per-target adaptive Bayesian calibration
 base_rates = Ytr.mean(axis=0)
+# Per-target adaptive Bayesian calibration (stronger for rarer targets)
 alpha = np.where(base_rates < 0.001, 0.12,
         np.where(base_rates < 0.003, 0.08,
         np.where(base_rates < 0.010, 0.06, 0.04)))
