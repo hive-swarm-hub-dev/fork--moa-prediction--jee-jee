@@ -25,6 +25,7 @@ from sklearn.decomposition import PCA
 from sklearn.dummy import DummyClassifier
 from sklearn.kernel_approximation import Nystroem
 from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings('ignore')
@@ -162,8 +163,90 @@ nys_preds = []
 for C in [0.1, 0.5]:
     nys_preds.append(sweep(Xtr_nys, Xte_nys, C, f"LR Nystroem C={C}"))
 
+# Polynomial kernel Nystroem (captures 2nd-order feature interactions)
+print("Fitting Poly Nystroem...")
+nys_poly = Nystroem(kernel='poly', degree=2, coef0=1,
+                    gamma=1.0/Xtr_s.shape[1],
+                    n_components=300, random_state=42).fit(Xtr_s)
+Xtr_poly = nys_poly.transform(Xtr_s).astype(np.float32)
+Xte_poly = nys_poly.transform(Xte_s).astype(np.float32)
+poly_fsc = StandardScaler().fit(Xtr_poly)
+Xtr_poly = poly_fsc.transform(Xtr_poly)
+Xte_poly = poly_fsc.transform(Xte_poly)
+print(f"  Poly Nystroem dim={Xtr_poly.shape[1]}  ({time.time()-t0:.1f}s)")
+
+print(f"Poly Nystroem LogReg... ({time.time()-t0:.1f}s elapsed)")
+poly_preds = []
+for C in [0.1, 0.5]:
+    poly_preds.append(sweep(Xtr_poly, Xte_poly, C, f"LR Poly C={C}"))
+
+# MLP on compact features (50-dim gc_pca + 6-dim condition = 56-dim)
+# Non-linear patterns that LR ensemble misses; ~100s at 56-dim (well within budget)
+print(f"MLP ensemble... ({time.time()-t0:.1f}s elapsed)")
+
+def make_cond(df):
+    t = df["cp_time"].values.astype(float)
+    dose = (df["cp_dose"] == "D2").astype(float).values
+    tnorm = (t - 24) / 48
+    t_oh = np.column_stack([(t == v).astype(float) for v in [24, 48, 72]])
+    return np.column_stack([tnorm, dose, tnorm * dose, t_oh]).astype(np.float32)
+
+Xtr_mlp = np.hstack([gc_tr, make_cond(Xtr)])
+Xte_mlp = np.hstack([gc_te, make_cond(Xte)])
+mlp_fsc = StandardScaler().fit(Xtr_mlp)
+Xtr_mlp_s = mlp_fsc.transform(Xtr_mlp)
+Xte_mlp_s = mlp_fsc.transform(Xte_mlp)
+
+def fit_mlp(X_tr, y_col, hidden, alpha):
+    y = y_col.astype(int)
+    if len(np.unique(y)) < 2:
+        return DummyClassifier(strategy="most_frequent").fit(X_tr, y)
+    return MLPClassifier(
+        hidden_layer_sizes=hidden, solver='lbfgs', max_iter=500,
+        alpha=alpha, random_state=42
+    ).fit(X_tr, y)
+
+def sweep_mlp(X_tr, X_te, label, hidden=(64,), alpha=0.001):
+    t1 = time.time()
+    ests = Parallel(n_jobs=-1)(
+        delayed(fit_mlp)(X_tr, Ytr[:, j], hidden, alpha)
+        for j in range(len(target_cols))
+    )
+    pred = np.column_stack([predict_clf(e, X_te) for e in ests]).astype(np.float32)
+    print(f"  {label}: {time.time()-t1:.1f}s")
+    return pred
+
+mlp_preds = [
+    sweep_mlp(Xtr_mlp_s, Xte_mlp_s, "MLP(64,) gc56"),           # compact 56-dim
+    sweep_mlp(Xtr_s, Xte_s, "MLP(64,) full325"),                  # full 325-dim
+    sweep_mlp(Xtr_mlp_s, Xte_mlp_s, "MLP(128,) gc56", (128,)),   # larger hidden
+]
+
+# LR on raw features (captures individual gene patterns beyond PCA top-120)
+# 772 gene + 100 cell + 6 cond = 878-dim; different signal from PCA-based models
+print(f"Raw feature LR... ({time.time()-t0:.1f}s elapsed)")
+Xtr_raw = np.hstack([Xtr[gene_cols + cell_cols].values, make_cond(Xtr)]).astype(np.float32)
+Xte_raw = np.hstack([Xte[gene_cols + cell_cols].values, make_cond(Xte)]).astype(np.float32)
+raw_fsc = StandardScaler().fit(Xtr_raw)
+Xtr_raw_s = raw_fsc.transform(Xtr_raw)
+Xte_raw_s = raw_fsc.transform(Xte_raw)
+
+raw_preds = []
+for C in [0.01, 0.02, 0.05, 0.10, 0.20, 0.50]:
+    raw_preds.append(sweep(Xtr_raw_s, Xte_raw_s, C, f"LR raw C={C}"))
+
+# Gene-only raw features (772-dim): more gene-expression-specific signal
+Xtr_gene = np.hstack([Xtr[gene_cols].values, make_cond(Xtr)]).astype(np.float32)
+Xte_gene = np.hstack([Xte[gene_cols].values, make_cond(Xte)]).astype(np.float32)
+gene_fsc = StandardScaler().fit(Xtr_gene)
+Xtr_gene_s = gene_fsc.transform(Xtr_gene)
+Xte_gene_s = gene_fsc.transform(Xte_gene)
+
+for C in [0.02, 0.05]:
+    raw_preds.append(sweep(Xtr_gene_s, Xte_gene_s, C, f"LR gene C={C}"))
+
 # ── blend + adaptive calibration ──────────────────────────────────────────────
-all_preds = base_preds + nys_preds   # 7 models
+all_preds = base_preds + nys_preds + poly_preds + mlp_preds + raw_preds   # 19 models
 blend = np.mean(all_preds, axis=0)
 
 base_rates = Ytr.mean(axis=0)
