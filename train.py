@@ -245,8 +245,18 @@ Xte_gene_s = gene_fsc.transform(Xte_gene)
 for C in [0.02, 0.05]:
     raw_preds.append(sweep(Xtr_gene_s, Xte_gene_s, C, f"LR gene C={C}"))
 
+# Cell-only raw features (100-dim): cell viability signal separate from gene expression
+Xtr_cell = np.hstack([Xtr[cell_cols].values, make_cond(Xtr)]).astype(np.float32)
+Xte_cell = np.hstack([Xte[cell_cols].values, make_cond(Xte)]).astype(np.float32)
+cell_fsc = StandardScaler().fit(Xtr_cell)
+Xtr_cell_s = cell_fsc.transform(Xtr_cell)
+Xte_cell_s = cell_fsc.transform(Xte_cell)
+
+for C in [0.01, 0.02, 0.05, 0.10, 0.20, 0.50]:
+    raw_preds.append(sweep(Xtr_cell_s, Xte_cell_s, C, f"LR cell C={C}"))
+
 # ── blend + adaptive calibration ──────────────────────────────────────────────
-all_preds = base_preds + nys_preds + poly_preds + mlp_preds + raw_preds   # 19 models
+all_preds = base_preds + nys_preds + poly_preds + mlp_preds + raw_preds  # 26 models
 blend = np.mean(all_preds, axis=0)
 
 base_rates = Ytr.mean(axis=0)
