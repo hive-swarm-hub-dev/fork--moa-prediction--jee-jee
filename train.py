@@ -10,7 +10,8 @@ Key improvements over previous approach:
   - 7 LR models blended (5 base C values + 2 Nystroem)
   - Per-target adaptive Bayesian calibration
 """
-import os
+import os, sys
+sys.stdout.reconfigure(line_buffering=True)
 os.environ['OMP_NUM_THREADS'] = '1'
 os.environ['OPENBLAS_NUM_THREADS'] = '1'
 os.environ['MKL_NUM_THREADS'] = '1'
@@ -23,9 +24,10 @@ from joblib import Parallel, delayed
 from scipy.stats import kurtosis as kurtosis_fn
 from sklearn.decomposition import PCA
 from sklearn.dummy import DummyClassifier
+from sklearn.ensemble import ExtraTreesClassifier
 from sklearn.kernel_approximation import Nystroem
-from sklearn.linear_model import LogisticRegression
-from sklearn.neural_network import MLPClassifier
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings('ignore')
@@ -217,10 +219,12 @@ def sweep_mlp(X_tr, X_te, label, hidden=(64,), alpha=0.001):
     return pred
 
 mlp_preds = [
-    sweep_mlp(Xtr_mlp_s, Xte_mlp_s, "MLP(64,) gc56"),           # compact 56-dim
-    sweep_mlp(Xtr_s, Xte_s, "MLP(64,) full325"),                  # full 325-dim
-    sweep_mlp(Xtr_mlp_s, Xte_mlp_s, "MLP(128,) gc56", (128,)),   # larger hidden
+    sweep_mlp(Xtr_mlp_s, Xte_mlp_s, "MLP(64,) gc56"),            # compact 56-dim
+    sweep_mlp(Xtr_s, Xte_s, "MLP(64,) full325"),                   # full 325-dim
+    sweep_mlp(Xtr_mlp_s, Xte_mlp_s, "MLP(128,) gc56", (128,)),    # larger hidden
+    sweep_mlp(Xtr_s, Xte_s, "MLP(128,) full325", (128,)),          # larger hidden, captures more complex patterns
 ]
+
 
 # LR on raw features (captures individual gene patterns beyond PCA top-120)
 # 772 gene + 100 cell + 6 cond = 878-dim; different signal from PCA-based models
@@ -256,7 +260,7 @@ for C in [0.01, 0.02, 0.05, 0.10, 0.20, 0.50]:
     raw_preds.append(sweep(Xtr_cell_s, Xte_cell_s, C, f"LR cell C={C}"))
 
 # ── blend + adaptive calibration ──────────────────────────────────────────────
-all_preds = base_preds + nys_preds + poly_preds + mlp_preds + raw_preds  # 26 models
+all_preds = base_preds + nys_preds + poly_preds + mlp_preds + raw_preds  # 27 models
 blend = np.mean(all_preds, axis=0)
 
 base_rates = Ytr.mean(axis=0)
